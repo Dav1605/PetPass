@@ -18,6 +18,8 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
+import * as Notifications from 'expo-notifications';
+import QRCode from 'react-native-qrcode-svg';
 import {
   PawPrint,
   Syringe,
@@ -46,7 +48,9 @@ import {
   ShoppingBag,
   FileDown,
   Sparkles,
+  QrCode,
   X,
+  Bell,
 } from 'lucide-react-native';
 import {
   initDatabase,
@@ -68,6 +72,17 @@ import {
 } from './src/database/db';
 import { Pet, VaccineDeworming, MedicalLog } from './src/types/petpass';
 
+// Configuración de notificaciones compatible con Expo SDK 52+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
+
 const formatDateInput = (text: string) => {
   const digits = text.replace(/\D/g, '').slice(0, 8);
   if (digits.length <= 2) return digits;
@@ -75,26 +90,59 @@ const formatDateInput = (text: string) => {
   return `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4, 8)}`;
 };
 
+// Convierte "DD/MM/AAAA" a objeto Date a las 09:00 AM
+const parseDateTo9AM = (dateStr: string): Date | null => {
+  const parts = dateStr.split('/');
+  if (parts.length !== 3) return null;
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+  if (isNaN(day) || isNaN(month) || isNaN(year) || year < 2024) return null;
+  const d = new Date(year, month, day, 9, 0, 0);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+// Genera el string estándar vCard 3.0 para que cualquier cámara reconozca el contacto offline
+const buildPetVCard = (pet: Pet): string => {
+  const cleanPhone = (pet.owner_phone || '').replace(/\s+/g, '');
+  const alertNote = pet.allergies
+    ? `ALERTA MEDICA: ${pet.allergies}`
+    : 'Sin alergias criticas registradas';
+  const infoNote = `Mascota: ${pet.name} (${pet.species}${pet.breed ? ' - ' + pet.breed : ''}) | ${alertNote}${
+    pet.microchip ? ' | Chip: ' + pet.microchip : ''
+  }`;
+
+  return [
+    'BEGIN:VCARD',
+    'VERSION:3.0',
+    `N:PetPass;${pet.name};;;`,
+    `FN:${pet.name} (Tutor: ${pet.owner_name || 'Contacto Emergencia'})`,
+    cleanPhone ? `TEL;TYPE=CELL,VOICE:${cleanPhone}` : '',
+    pet.owner_address ? `ADR;TYPE=HOME:;;${pet.owner_address};;;;` : '',
+    `NOTE:${infoNote}`,
+    'END:VCARD',
+  ]
+    .filter(Boolean)
+    .join('\n');
+};
+
 export default function App() {
   const [petsList, setPetsList] = useState<Pet[]>([]);
   const [pet, setPet] = useState<Pet | null>(null);
   const [activeTab, setActiveTab] = useState<'carnet' | 'bitacora' | 'urgencia' | 'cercanas'>('carnet');
 
-  // Listas de datos de la mascota activa
   const [vaccines, setVaccines] = useState<VaccineDeworming[]>([]);
   const [logs, setLogs] = useState<MedicalLog[]>([]);
 
-  // Modales principales
   const [petModalVisible, setPetModalVisible] = useState(false);
   const [isCreatingNewPet, setIsCreatingNewPet] = useState(false);
   const [vaccineModalVisible, setVaccineModalVisible] = useState(false);
   const [logModalVisible, setLogModalVisible] = useState(false);
+  const [qrModalVisible, setQrModalVisible] = useState(false);
 
-  // Selector de Fotos Compatible con iOS y Android (Sin anidar Modals)
   const [imageSheetVisible, setImageSheetVisible] = useState(false);
   const [imageTarget, setImageTarget] = useState<'pet' | 'pet_direct' | 'vaccine' | 'log'>('pet');
 
-  // Bottom Sheet: Confirmación de Borrado
   const [deleteSheetVisible, setDeleteSheetVisible] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{
     type: 'vaccine' | 'log' | 'pet';
@@ -102,16 +150,13 @@ export default function App() {
     title: string;
   } | null>(null);
 
-  // Estados de edición
   const [editingVaccineId, setEditingVaccineId] = useState<number | null>(null);
   const [editingLogId, setEditingLogId] = useState<number | null>(null);
 
-  // Toast inferior animado
   const [toastMsg, setToastMsg] = useState('');
   const [toastType, setToastType] = useState<'success' | 'delete' | 'warning'>('success');
   const toastAnim = useRef(new Animated.Value(160)).current;
 
-  // Formulario Mascota + Dueño
   const [name, setName] = useState('');
   const [speciesMode, setSpeciesMode] = useState<'Perro' | 'Gato' | 'Otra'>('Perro');
   const [customSpecies, setCustomSpecies] = useState('');
@@ -128,39 +173,87 @@ export default function App() {
   const [ownerRut, setOwnerRut] = useState('');
   const [ownerAddress, setOwnerAddress] = useState('');
 
-  // Formulario Vacuna / Antiparasitario
   const [vType, setVType] = useState<'vaccine' | 'deworming'>('vaccine');
   const [vProduct, setVProduct] = useState('');
   const [vApplied, setVApplied] = useState('');
   const [vNext, setVNext] = useState('');
   const [vPhoto, setVPhoto] = useState<string | null>(null);
 
-  // Formulario Bitácora / Tratamiento
   const [lCategory, setLCategory] = useState<'medication' | 'consultation' | 'symptom'>('medication');
   const [lTitle, setLTitle] = useState('');
   const [lSchedule, setLSchedule] = useState('');
+  const [lAlarmHours, setLAlarmHours] = useState<number | null>(8); // Intervalo real en horas (null = sin alarma)
   const [lNotes, setLNotes] = useState('');
   const [lDate, setLDate] = useState('');
   const [lPhoto, setLPhoto] = useState<string | null>(null);
 
-  // Formulario Emergencia
   const [vetName, setVetName] = useState('');
   const [vetPhone, setVetPhone] = useState('');
   const [clinicName, setClinicName] = useState('');
   const [clinicPhone, setClinicPhone] = useState('');
   const [clinicAddress, setClinicAddress] = useState('');
 
-  // Buscador libre en pestaña Cercanas
-  const [customNearQuery, setCustomNearQuery] = useState('');
-
   useEffect(() => {
     try {
       initDatabase();
       loadData();
+      requestNotificationPermissions();
     } catch (error) {
       console.error('Error iniciando BD:', error);
     }
   }, []);
+
+  const requestNotificationPermissions = async () => {
+    const { status: existingStatus } = await Notifications.getPermissionsAsync();
+    if (existingStatus !== 'granted') {
+      await Notifications.requestPermissionsAsync();
+    }
+  };
+
+  // Programa una alerta en fecha/hora real o por intervalo en segundos
+  const scheduleRealNotification = async (
+    title: string,
+    body: string,
+    options: { targetDate?: Date; intervalSeconds?: number }
+  ) => {
+    try {
+      if (options.targetDate) {
+        const now = Date.now();
+        // Intentar avisar 24 horas antes a las 9:00 AM; si falta menos de 24h, avisar el mismo día a las 9:00 AM
+        const dayBefore = new Date(options.targetDate.getTime() - 24 * 60 * 60 * 1000);
+        const fireDate = dayBefore.getTime() > now ? dayBefore : options.targetDate;
+        const diffSeconds = Math.floor((fireDate.getTime() - now) / 1000);
+
+        if (diffSeconds > 60) {
+          await Notifications.scheduleNotificationAsync({
+            content: {
+              title: `🐾 PetPass: ${title}`,
+              body,
+              sound: true,
+            },
+            trigger: {
+              type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+              seconds: diffSeconds,
+            },
+          });
+        }
+      } else if (options.intervalSeconds && options.intervalSeconds > 0) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: `🐾 PetPass: ${title}`,
+            body,
+            sound: true,
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+            seconds: options.intervalSeconds,
+          },
+        });
+      }
+    } catch (error) {
+      console.warn('Error programando notificación:', error);
+    }
+  };
 
   const showToast = (
     message: string,
@@ -214,7 +307,6 @@ export default function App() {
     </Animated.View>
   );
 
-  // CAPA OVERLAY DE FOTOS (FUNCIONA EN IPHONE Y ANDROID SIN BLOQUEAR MODALES)
   const renderImagePickerOverlay = () => {
     if (!imageSheetVisible) return null;
     return (
@@ -266,7 +358,6 @@ export default function App() {
     );
   };
 
-  // CAPA OVERLAY DE CONFIRMACIÓN DE BORRADO
   const renderDeleteConfirmOverlay = () => {
     if (!deleteSheetVisible) return null;
     return (
@@ -439,7 +530,6 @@ export default function App() {
     setPetModalVisible(false);
   };
 
-  // --- SELECTOR DE IMAGEN COMPATIBLE CON IPHONE (IOS) Y ANDROID ---
   const openImagePickerSheet = (target: 'pet' | 'pet_direct' | 'vaccine' | 'log') => {
     setImageTarget(target);
     setImageSheetVisible(true);
@@ -450,7 +540,6 @@ export default function App() {
       setPetPhoto(uri);
       showToast('Foto cargada en la ficha', 'success');
     } else if (imageTarget === 'pet_direct' && pet) {
-      // Si el usuario tocó el círculo de foto directo desde el inicio, guarda al instante en SQLite
       updatePet({ ...pet, photo_uri: uri });
       setPetPhoto(uri);
       loadData(pet.id);
@@ -466,7 +555,6 @@ export default function App() {
 
   const handleTakePhoto = async () => {
     setImageSheetVisible(false);
-    // Pequeña pausa de 150ms para que iOS cierre suavemente el overlay antes de lanzar la cámara nativa
     setTimeout(async () => {
       try {
         const perm = await ImagePicker.requestCameraPermissionsAsync();
@@ -555,11 +643,13 @@ export default function App() {
     }
   };
 
-  // --- GENERADOR DE CARNET PDF PARA WHATSAPP (AQUÍ SÍ APARECE EL RUT DEL TUTOR) ---
   const handleExportPDF = async () => {
     if (!pet) return;
     try {
       const em = getEmergencyContact(pet.id);
+      const vCardEncoded = encodeURIComponent(buildPetVCard(pet));
+      const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=${vCardEncoded}`;
+
       const vaccineRows =
         vaccines.length > 0
           ? vaccines
@@ -616,6 +706,7 @@ export default function App() {
             .pet-name { font-size: 22px; font-weight: bold; color: #0F172A; margin: 0 0 6px 0; }
             .row-text { font-size: 13px; margin: 4px 0; color: #334155; }
             .alert-box { background: #FEF2F2; border: 1.5px solid #F87171; color: #B91C1C; padding: 12px; border-radius: 8px; font-weight: bold; font-size: 14px; margin-bottom: 18px; }
+            .qr-credencial { background: #EFF6FF; border: 1.5px dashed #3B82F6; border-radius: 10px; padding: 14px; margin-bottom: 18px; display: flex; align-items: center; justify-content: space-between; }
             h3 { font-size: 15px; color: #0F172A; border-bottom: 1px solid #CBD5E1; padding-bottom: 6px; margin-top: 22px; }
             table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
             th { background: #EFF6FF; color: #1D4ED8; text-align: left; padding: 8px; border: 1px solid #BFDBFE; }
@@ -637,6 +728,17 @@ export default function App() {
               ? `<div class="alert-box">⚠️ ALERTA MÉDICA / ALERGIAS: ${pet.allergies}</div>`
               : ''
           }
+
+          <div class="qr-credencial">
+            <div style="flex:1; padding-right:12px;">
+              <div style="font-size:14px; font-weight:bold; color:#1D4ED8; margin-bottom:4px;">🏷️ CREDENCIAL Y PLACA QR DE EMERGENCIA</div>
+              <div style="font-size:13px; color:#334155;">Escanea este código QR con cualquier cámara para guardar el contacto directo y alertas médicas de <strong>${pet.name}</strong> sin necesidad de internet.</div>
+              <div style="font-size:12px; color:#64748B; margin-top:4px;">Teléfono Tutor: <strong>${pet.owner_phone || 'No registrado'}</strong></div>
+            </div>
+            <div style="background:#FFF; padding:6px; border-radius:8px; border:1px solid #BFDBFE;">
+              <img src="${qrImageUrl}" width="84" height="84" />
+            </div>
+          </div>
 
           <div class="grid">
             <div class="card">
@@ -748,7 +850,6 @@ export default function App() {
     }
   };
 
-  // --- FUNCIONES VACUNAS ---
   const openNewVaccineModal = () => {
     setEditingVaccineId(null);
     setVType('vaccine');
@@ -806,6 +907,19 @@ export default function App() {
       return;
     }
 
+    let alarmScheduled = false;
+    if (vNext.trim()) {
+      const targetDate = parseDateTo9AM(vNext.trim());
+      if (targetDate && targetDate.getTime() > Date.now()) {
+        scheduleRealNotification(
+          `Próxima dosis para ${pet.name}`,
+          `Recuerda aplicar ${vProduct.trim()} (fecha programada: ${vNext.trim()}).`,
+          { targetDate }
+        );
+        alarmScheduled = true;
+      }
+    }
+
     if (editingVaccineId) {
       updateVaccineDeworming({
         id: editingVaccineId,
@@ -816,7 +930,10 @@ export default function App() {
         next_due_date: vNext.trim(),
         photo_uri: vPhoto,
       });
-      showToast('Registro sanitario actualizado', 'success');
+      showToast(
+        alarmScheduled ? 'Actualizado y recordatorio agendado' : 'Registro sanitario actualizado',
+        'success'
+      );
     } else {
       addVaccineDeworming({
         pet_id: pet.id,
@@ -826,18 +943,21 @@ export default function App() {
         next_due_date: vNext.trim(),
         photo_uri: vPhoto,
       });
-      showToast('Guardado en el Carnet', 'success');
+      showToast(
+        alarmScheduled ? 'Guardado y recordatorio agendado' : 'Guardado en el Carnet',
+        'success'
+      );
     }
     setVaccineModalVisible(false);
     loadData(pet.id);
   };
 
-  // --- FUNCIONES BITÁCORA ---
   const openNewLogModal = () => {
     setEditingLogId(null);
     setLCategory('medication');
     setLTitle('');
     setLSchedule('');
+    setLAlarmHours(8);
     setLNotes('');
     setLDate('');
     setLPhoto(null);
@@ -849,6 +969,7 @@ export default function App() {
     setLCategory(log.category);
     setLTitle(log.title);
     setLSchedule(log.dosage_schedule || '');
+    setLAlarmHours(null);
     setLNotes(log.notes || '');
     setLDate(formatDateInput(log.date || ''));
     setLPhoto(log.photo_uri || null);
@@ -860,6 +981,7 @@ export default function App() {
     setLCategory(newCat);
     setLTitle('');
     setLSchedule('');
+    setLAlarmHours(newCat === 'medication' ? 8 : null);
     setLNotes('');
     setLDate('');
     setLPhoto(null);
@@ -870,10 +992,10 @@ export default function App() {
       return {
         titleLabel: 'Nombre del Medicamento *',
         titlePlaceholder: 'Ej. Hemolitan, Amoxicilina, Meloxicam...',
-        secondaryLabel: 'Dosis y Horario',
-        secondaryPlaceholder: 'Ej. Cada 12 hrs x 7 días',
+        secondaryLabel: 'Dosis y Duración',
+        secondaryPlaceholder: 'Ej. 5 gotas por 7 días',
         notesLabel: 'Indicaciones / Dosis en gotas o ml',
-        notesPlaceholder: 'Ej. Dar con comida, 5 gotas en la mañana...',
+        notesPlaceholder: 'Ej. Dar con comida en la mañana...',
       };
     }
     if (lCategory === 'consultation') {
@@ -881,7 +1003,7 @@ export default function App() {
         titleLabel: 'Motivo de la Consulta o Control *',
         titlePlaceholder: 'Ej. Control sano, Retiro de puntos, Vacunación...',
         secondaryLabel: 'Clínica o Veterinario que atendió (Opcional)',
-        secondaryPlaceholder: 'Ej. Dra. Paloma / Clínica Lincius',
+        secondaryPlaceholder: 'Ej. Dra. Paloma / Clínica Veterinaria',
         notesLabel: 'Diagnóstico / Indicaciones del Veterinario',
         notesPlaceholder: 'Ej. Peso estable, recetó dieta blanda por 3 días...',
       };
@@ -914,6 +1036,25 @@ export default function App() {
       return;
     }
 
+    let alarmSet = false;
+    if (lCategory === 'medication' && lAlarmHours && lAlarmHours > 0) {
+      const freqLabel = `Cada ${lAlarmHours} hrs`;
+      const scheduleText = lSchedule.trim() ? `${freqLabel} • ${lSchedule.trim()}` : freqLabel;
+      scheduleRealNotification(
+        `Hora de medicina para ${pet.name}`,
+        `Dar tratamiento: ${lTitle.trim()} (${scheduleText})`,
+        { intervalSeconds: lAlarmHours * 3600 }
+      );
+      alarmSet = true;
+    }
+
+    const finalSchedule =
+      lCategory === 'medication' && lAlarmHours
+        ? lSchedule.trim()
+          ? `Cada ${lAlarmHours} hrs • ${lSchedule.trim()}`
+          : `Cada ${lAlarmHours} hrs`
+        : lSchedule.trim();
+
     const today = formatDateInput(new Date().toLocaleDateString('es-CL'));
     if (editingLogId) {
       updateMedicalLog({
@@ -922,30 +1063,35 @@ export default function App() {
         category: lCategory,
         title: lTitle.trim(),
         notes: lNotes.trim(),
-        dosage_schedule: lSchedule.trim(),
+        dosage_schedule: finalSchedule,
         is_completed: 0,
         date: lDate.trim() || today,
         photo_uri: lPhoto,
       });
-      showToast('Bitácora actualizada', 'success');
+      showToast(
+        alarmSet ? `Bitácora actualizada (aviso en ${lAlarmHours}h)` : 'Bitácora actualizada',
+        'success'
+      );
     } else {
       addMedicalLog({
         pet_id: pet.id,
         category: lCategory,
         title: lTitle.trim(),
         notes: lNotes.trim(),
-        dosage_schedule: lSchedule.trim(),
+        dosage_schedule: finalSchedule,
         is_completed: 0,
         date: lDate.trim() || today,
         photo_uri: lPhoto,
       });
-      showToast('Agregado a la Bitácora', 'success');
+      showToast(
+        alarmSet ? `Guardado • Alarma en ${lAlarmHours} hrs` : 'Agregado a la bitácora',
+        'success'
+      );
     }
     setLogModalVisible(false);
     loadData(pet.id);
   };
 
-  // --- CONFIRMACIÓN DE BORRADO ---
   const askDelete = (type: 'vaccine' | 'log' | 'pet', id: number, title: string) => {
     setDeleteTarget({ type, id, title });
     setDeleteSheetVisible(true);
@@ -971,7 +1117,6 @@ export default function App() {
     setDeleteTarget(null);
   };
 
-  // --- FUNCIONES EMERGENCIA Y RADAR DE MAPAS ---
   const handleSaveEmergency = () => {
     if (!pet) return;
     saveOrUpdateEmergency({
@@ -1021,11 +1166,9 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" />
 
-      {/* TOAST EN PANTALLA PRINCIPAL */}
       {renderToastPill()}
 
       {!pet ? (
-        /* PANTALLA DE BIENVENIDA REDISEÑADA (MODERNA Y ATRACTIVA) */
         <ScrollView contentContainerStyle={styles.welcomeScroll}>
           <View style={styles.welcomeHeroCard}>
             <View style={styles.welcomeIconBadge}>
@@ -1047,9 +1190,9 @@ export default function App() {
                 <Syringe size={20} color="#2563EB" strokeWidth={2.2} />
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.welcomeFeatureTitle}>Carnet y Exportación a PDF</Text>
+                <Text style={styles.welcomeFeatureTitle}>Carnet, PDF y Placa QR</Text>
                 <Text style={styles.welcomeFeatureDesc}>
-                  Guarda stickers de vacunas, desparasitaciones y comparte el carnet oficial por WhatsApp.
+                  Exporta carnets formales a PDF con credencial QR vCard escaneable offline.
                 </Text>
               </View>
             </View>
@@ -1059,9 +1202,9 @@ export default function App() {
                 <Pill size={20} color="#16A34A" strokeWidth={2.2} />
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.welcomeFeatureTitle}>Bitácora de Remedios y Controles</Text>
+                <Text style={styles.welcomeFeatureTitle}>Bitácora con Alarmas Locales</Text>
                 <Text style={styles.welcomeFeatureDesc}>
-                  Registra tratamientos con horarios, síntomas, fotos de recetas y notas del veterinario.
+                  Recibe avisos automáticos en tu teléfono para próximas dosis y remedios.
                 </Text>
               </View>
             </View>
@@ -1073,7 +1216,7 @@ export default function App() {
               <View style={{ flex: 1 }}>
                 <Text style={styles.welcomeFeatureTitle}>Radar de Urgencias 24/7</Text>
                 <Text style={styles.welcomeFeatureDesc}>
-                  Encuentra clínicas veterinarias cercanas por GPS y llama a urgencias con un toque.
+                  Encuentra clínicas veterinarias cercanas por GPS y llama con un toque.
                 </Text>
               </View>
             </View>
@@ -1132,7 +1275,6 @@ export default function App() {
           {/* TARJETA SUPERIOR DEL PERFIL */}
           <View style={styles.headerCard}>
             <View style={styles.headerTop}>
-              {/* Tocar la foto en el inicio ahora abre directo el selector y guarda la foto al instante */}
               <TouchableOpacity
                 style={styles.avatarContainer}
                 onPress={() => openImagePickerSheet('pet_direct')}
@@ -1153,6 +1295,19 @@ export default function App() {
                 <View style={styles.nameRow}>
                   <Text style={styles.petName}>{pet.name}</Text>
                   <View style={{ flexDirection: 'row' }}>
+                    <TouchableOpacity
+                      style={[
+                        styles.editBadge,
+                        { backgroundColor: '#F0FDF4', borderColor: '#BBF7D0', borderWidth: 1, marginRight: 6 },
+                      ]}
+                      onPress={() => setQrModalVisible(true)}
+                    >
+                      <QrCode size={13} color="#15803D" strokeWidth={2.2} />
+                      <Text style={[styles.editBadgeText, { color: '#15803D', marginLeft: 4 }]}>
+                        QR
+                      </Text>
+                    </TouchableOpacity>
+
                     <TouchableOpacity
                       style={[
                         styles.editBadge,
@@ -1193,7 +1348,6 @@ export default function App() {
               </View>
             </View>
 
-            {/* TARJETA COMPACTA DEL TUTOR (SIN MOSTRAR EL RUT EN PANTALLA, SOLO NOMBRE Y DIRECCIÓN) */}
             {pet.owner_name || pet.owner_phone ? (
               <View style={styles.ownerBar}>
                 <View style={{ flex: 1 }}>
@@ -1237,7 +1391,7 @@ export default function App() {
             ) : null}
           </View>
 
-          {/* 4 PESTAÑAS DE NAVEGACIÓN */}
+          {/* 4 PESTAÑAS */}
           <View style={styles.tabBar}>
             <TouchableOpacity
               style={[styles.tab, activeTab === 'carnet' && styles.activeTab]}
@@ -1304,13 +1458,12 @@ export default function App() {
             </TouchableOpacity>
           </View>
 
-          {/* CONTENIDO DE LA PESTAÑA ACTIVA */}
+          {/* CONTENIDO */}
           <ScrollView
             style={styles.content}
             contentContainerStyle={{ paddingBottom: 130 }}
             keyboardShouldPersistTaps="handled"
           >
-            {/* PESTAÑA 1: CARNET */}
             {activeTab === 'carnet' && (
               <View>
                 <TouchableOpacity style={styles.addBtn} onPress={openNewVaccineModal}>
@@ -1378,7 +1531,6 @@ export default function App() {
               </View>
             )}
 
-            {/* PESTAÑA 2: BITÁCORA Y TRATAMIENTOS */}
             {activeTab === 'bitacora' && (
               <View>
                 <TouchableOpacity style={styles.addBtn} onPress={openNewLogModal}>
@@ -1498,7 +1650,6 @@ export default function App() {
               </View>
             )}
 
-            {/* PESTAÑA 3: TARJETA DE EMERGENCIA */}
             {activeTab === 'urgencia' && (
               <View style={styles.itemCard}>
                 <View style={styles.sectionTitleRow}>
@@ -1563,13 +1714,13 @@ export default function App() {
                 </View>
 
                 <Text style={styles.helperLabel}>
-                  Ciudad / Comuna o dirección (opcional, si lo dejas vacío buscará por el nombre de la clínica):
+                  Ciudad / Comuna o dirección (opcional):
                 </Text>
                 <TextInput
                   style={styles.input}
                   value={clinicAddress}
                   onChangeText={setClinicAddress}
-                  placeholder="Ej. Centro / Av. Principal 123 (o deja en blanco)"
+                  placeholder="Ej. Centro / Av. Principal 123"
                 />
 
                 <TouchableOpacity style={styles.mapBtn} onPress={openSmartMaps}>
@@ -1588,7 +1739,6 @@ export default function App() {
               </View>
             )}
 
-            {/* PESTAÑA 4: RADAR DE VETERINARIAS CERCANAS (GPS) */}
             {activeTab === 'cercanas' && (
               <View style={styles.itemCard}>
                 <View style={styles.sectionTitleRow}>
@@ -1596,7 +1746,7 @@ export default function App() {
                   <Text style={styles.sectionTitle}>Radar de Veterinarias Cercanas</Text>
                 </View>
                 <Text style={styles.helperLabel}>
-                  Toca una categoría para buscar en el mapa usando tu ubicación actual en tiempo real:
+                  Toca una categoría para buscar en el mapa usando tu ubicación actual:
                 </Text>
 
                 <TouchableOpacity
@@ -1651,42 +1801,68 @@ export default function App() {
                   </View>
                   <Navigation size={18} color="#16A34A" strokeWidth={2.2} />
                 </TouchableOpacity>
-
-                <View style={styles.divider} />
-
-                <Text style={styles.label}>Búsqueda específica en Mapa</Text>
-                <View style={styles.row}>
-                  <TextInput
-                    style={[styles.input, { flex: 1, marginRight: 8, marginBottom: 0 }]}
-                    value={customNearQuery}
-                    onChangeText={setCustomNearQuery}
-                    placeholder="Ej. Radiografía veterinaria, Ecografía..."
-                  />
-                  <TouchableOpacity
-                    style={[styles.callBtn, { backgroundColor: '#2563EB' }]}
-                    onPress={() =>
-                      searchNearbyOnMap(
-                        customNearQuery.trim()
-                          ? `${customNearQuery.trim()} veterinaria`
-                          : 'veterinaria cerca de mi'
-                      )
-                    }
-                  >
-                    <MapPin size={15} color="#FFF" strokeWidth={2.2} />
-                    <Text style={styles.callBtnText}>Ver Mapa</Text>
-                  </TouchableOpacity>
-                </View>
               </View>
             )}
           </ScrollView>
         </KeyboardAvoidingView>
       )}
 
-      {/* OVERLAYS EN PANTALLA PRINCIPAL (CUANDO NO HAY MODAL ABIERTO) */}
-      {!petModalVisible && !vaccineModalVisible && !logModalVisible && renderImagePickerOverlay()}
-      {!petModalVisible && !vaccineModalVisible && !logModalVisible && renderDeleteConfirmOverlay()}
+      {/* OVERLAYS */}
+      {!petModalVisible && !vaccineModalVisible && !logModalVisible && !qrModalVisible && renderImagePickerOverlay()}
+      {!petModalVisible && !vaccineModalVisible && !logModalVisible && !qrModalVisible && renderDeleteConfirmOverlay()}
 
-      {/* MODAL CREAR / EDITAR PERFIL MASCOTA + DUEÑO */}
+      {/* MODAL: PLACA QR VCARD REAL ESCANEABLE */}
+      <Modal visible={qrModalVisible} transparent animationType="fade">
+        <View style={styles.qrModalOverlay}>
+          <View style={styles.qrModalCard}>
+            <View style={styles.sheetHandle} />
+            <View style={{ alignItems: 'center', marginBottom: 14 }}>
+              <View style={[styles.sheetIconCircle, { backgroundColor: '#DCFCE7', marginBottom: 8, marginRight: 0 }]}>
+                <QrCode size={26} color="#15803D" strokeWidth={2.2} />
+              </View>
+              <Text style={styles.sheetTitle}>Placa QR de Emergencia</Text>
+              <Text style={[styles.sheetSubtitle, { textAlign: 'center', marginBottom: 0 }]}>
+                Escanea con la cámara de cualquier teléfono para guardar el contacto de {pet?.name} sin internet.
+              </Text>
+            </View>
+
+            <View style={styles.qrMockContainer}>
+              <View style={styles.qrGridBox}>
+                {pet ? (
+                  <QRCode
+                    value={buildPetVCard(pet)}
+                    size={150}
+                    color="#0F172A"
+                    backgroundColor="#FFFFFF"
+                  />
+                ) : null}
+              </View>
+              <Text style={styles.qrPetNameText}>{pet?.name}</Text>
+              <Text style={styles.qrSubText}>
+                {pet?.species} • Tutor: {pet?.owner_name || 'No asignado'}
+              </Text>
+              <Text style={[styles.qrSubText, { fontWeight: '700', color: '#1D4ED8', marginTop: 2 }]}>
+                Tel: {pet?.owner_phone || 'Sin teléfono'}
+              </Text>
+              {pet?.allergies ? (
+                <View style={styles.qrAlertBadge}>
+                  <AlertTriangle size={12} color="#B91C1C" strokeWidth={2.2} />
+                  <Text style={styles.qrAlertBadgeText}>ALERTA: {pet.allergies}</Text>
+                </View>
+              ) : null}
+            </View>
+
+            <TouchableOpacity
+              style={[styles.primaryBtn, { backgroundColor: '#2563EB', marginTop: 0 }]}
+              onPress={() => setQrModalVisible(false)}
+            >
+              <Text style={styles.primaryBtnText}>Cerrar Tarjeta</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* MODAL CREAR / EDITAR MASCOTA */}
       <Modal visible={petModalVisible} animationType="slide">
         <SafeAreaView style={styles.safeAreaModal}>
           {renderToastPill()}
@@ -1763,7 +1939,7 @@ export default function App() {
                   style={styles.input}
                   value={customSpecies}
                   onChangeText={setCustomSpecies}
-                  placeholder="Escribe la especie (ej. Conejo, Tortuga, Erizo, Ave...)"
+                  placeholder="Escribe la especie (ej. Conejo, Tortuga...)"
                 />
               )}
 
@@ -1792,7 +1968,7 @@ export default function App() {
                 style={styles.input}
                 value={breed}
                 onChangeText={setBreed}
-                placeholder="Ej. Mestizo, Cocker Spaniel, Pastor Alemán..."
+                placeholder="Ej. Mestizo, Cocker Spaniel..."
               />
 
               <View style={styles.row}>
@@ -1836,7 +2012,7 @@ export default function App() {
                 style={[styles.input, { borderColor: '#FCA5A5', backgroundColor: '#FEF2F2' }]}
                 value={allergies}
                 onChangeText={setAllergies}
-                placeholder="Ej. Alergia alimentaria, cardíaco, ninguna..."
+                placeholder="Ej. Alergia al pollo, cardíaco..."
               />
 
               <View style={styles.divider} />
@@ -1851,7 +2027,7 @@ export default function App() {
               {existingOwners.length > 0 && (
                 <View style={{ marginBottom: 8 }}>
                   <Text style={styles.helperLabel}>
-                    ¿Es el mismo tutor de otra mascota? Toca para rellenar rápido o escribe uno distinto abajo:
+                    ¿Es el mismo tutor de otra mascota? Toca para rellenar rápido:
                   </Text>
                   <ScrollView horizontal showsHorizontalScrollIndicator={false}>
                     {existingOwners.map((oPet) => (
@@ -1875,7 +2051,7 @@ export default function App() {
                 style={styles.input}
                 value={ownerName}
                 onChangeText={setOwnerName}
-                placeholder="Ej. Juan Pérez / María González"
+                placeholder="Ej. Juan Pérez"
               />
 
               <View style={styles.row}>
@@ -1905,7 +2081,7 @@ export default function App() {
                 style={styles.input}
                 value={ownerAddress}
                 onChangeText={setOwnerAddress}
-                placeholder="Ej. Av. Principal 1234"
+                placeholder="Ej. Villa Alemana"
               />
 
               <TouchableOpacity style={styles.primaryBtn} onPress={handleSavePet}>
@@ -1931,14 +2107,12 @@ export default function App() {
               )}
             </ScrollView>
           </KeyboardAvoidingView>
-
-          {/* OVERLAYS DENTRO DEL MODAL DE MASCOTA PARA QUE FUNCIONEN EN IPHONE */}
           {renderImagePickerOverlay()}
           {renderDeleteConfirmOverlay()}
         </SafeAreaView>
       </Modal>
 
-      {/* MODAL AGREGAR / EDITAR VACUNA */}
+      {/* MODAL VACUNA */}
       <Modal visible={vaccineModalVisible} animationType="slide">
         <SafeAreaView style={styles.safeAreaModal}>
           {renderToastPill()}
@@ -2010,8 +2184,8 @@ export default function App() {
                 onChangeText={setVProduct}
                 placeholder={
                   vType === 'vaccine'
-                    ? 'Ej. Óctuple, Antirrábica, Séxtuple...'
-                    : 'Ej. Bravecto, NexGard, Drontal...'
+                    ? 'Ej. Óctuple, Antirrábica...'
+                    : 'Ej. Bravecto, NexGard...'
                 }
               />
 
@@ -2025,7 +2199,7 @@ export default function App() {
                 placeholder="DD/MM/AAAA"
               />
 
-              <Text style={styles.label}>Fecha Próxima Dosis / Refuerzo</Text>
+              <Text style={styles.label}>Fecha Próxima Dosis / Refuerzo (Recordatorio 9:00 AM)</Text>
               <TextInput
                 style={styles.input}
                 value={vNext}
@@ -2055,7 +2229,7 @@ export default function App() {
 
               <TouchableOpacity style={styles.primaryBtn} onPress={handleSaveVaccine}>
                 <Text style={styles.primaryBtnText}>
-                  {editingVaccineId ? 'Guardar Cambios' : 'Guardar en el Carnet'}
+                  {editingVaccineId ? 'Guardar Cambios' : 'Guardar y Agendar Recordatorio'}
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -2069,13 +2243,11 @@ export default function App() {
               </TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
-
-          {/* OVERLAY DE FOTOS DENTRO DEL MODAL DE VACUNAS */}
           {renderImagePickerOverlay()}
         </SafeAreaView>
       </Modal>
 
-      {/* MODAL AGREGAR / EDITAR BITÁCORA (AHORA TAMBIÉN PERMITE ADJUNTAR FOTO) */}
+      {/* MODAL BITÁCORA */}
       <Modal visible={logModalVisible} animationType="slide">
         <SafeAreaView style={styles.safeAreaModal}>
           {renderToastPill()}
@@ -2173,6 +2345,44 @@ export default function App() {
                 placeholder={logLabels.titlePlaceholder}
               />
 
+              {lCategory === 'medication' && (
+                <View style={{ marginBottom: 4 }}>
+                  <View style={styles.inlineMetaRow}>
+                    <Bell size={13} color="#2563EB" strokeWidth={2.2} />
+                    <Text style={[styles.label, { marginTop: 0, marginLeft: 5 }]}>
+                      Programar Alarma de Toma
+                    </Text>
+                  </View>
+                  <View style={styles.row}>
+                    {[
+                      { label: 'Cada 8h', hrs: 8 },
+                      { label: 'Cada 12h', hrs: 12 },
+                      { label: 'Cada 24h', hrs: 24 },
+                      { label: 'Sin alarma', hrs: null },
+                    ].map((opt) => (
+                      <TouchableOpacity
+                        key={opt.label}
+                        style={[
+                          styles.miniSelector,
+                          lAlarmHours === opt.hrs && styles.typeSelectorActive,
+                        ]}
+                        onPress={() => setLAlarmHours(opt.hrs)}
+                      >
+                        <Text
+                          style={[
+                            styles.miniSelectorText,
+                            { fontSize: 12 },
+                            lAlarmHours === opt.hrs && { color: '#1D4ED8', fontWeight: '700' },
+                          ]}
+                        >
+                          {opt.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              )}
+
               <Text style={styles.label}>{logLabels.secondaryLabel}</Text>
               <TextInput
                 style={styles.input}
@@ -2212,7 +2422,7 @@ export default function App() {
                       <Camera size={22} color="#2563EB" strokeWidth={2.2} />
                     </View>
                     <Text style={styles.photoPickerText}>
-                      Adjuntar Foto de Receta / Orden / Síntoma (Opcional)
+                      Adjuntar Foto de Receta / Orden (Opcional)
                     </Text>
                   </View>
                 )}
@@ -2220,7 +2430,7 @@ export default function App() {
 
               <TouchableOpacity style={styles.primaryBtn} onPress={handleSaveLog}>
                 <Text style={styles.primaryBtnText}>
-                  {editingLogId ? 'Guardar Cambios' : 'Guardar Registro'}
+                  {editingLogId ? 'Guardar Cambios' : 'Guardar en Bitácora'}
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -2234,8 +2444,6 @@ export default function App() {
               </TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
-
-          {/* OVERLAY DE FOTOS DENTRO DEL MODAL DE BITÁCORA */}
           {renderImagePickerOverlay()}
         </SafeAreaView>
       </Modal>
@@ -2254,7 +2462,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 28) + 6 : 12,
   },
-  // PANTALLA DE BIENVENIDA (ONBOARDING)
   welcomeScroll: {
     flexGrow: 1,
     padding: 20,
@@ -2353,8 +2560,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     elevation: 4,
   },
-
-  // BARRA SELECTORA DE MASCOTAS
   petSwitcherBar: {
     backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
@@ -2403,8 +2608,6 @@ const styles = StyleSheet.create({
     color: '#2563EB',
     marginLeft: 4,
   },
-
-  // TOAST INFERIOR TIPO PÍLDORA
   toastPill: {
     position: 'absolute',
     bottom: 76,
@@ -2431,7 +2634,6 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   toastText: { color: '#FFFFFF', fontWeight: '600', fontSize: 14 },
-
   headerCard: {
     backgroundColor: '#FFF',
     paddingHorizontal: 16,
@@ -2669,7 +2871,6 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   row: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  btnContentRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
   photoPicker: {
     height: 130,
     borderWidth: 1.5,
@@ -2767,8 +2968,6 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   mapBtnText: { color: '#1D4ED8', fontWeight: 'bold', fontSize: 14 },
-
-  // TARJETAS DE RADAR CERCANO
   nearbyCardBtn: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2779,8 +2978,6 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     marginBottom: 10,
   },
-
-  // ESTILOS DE OVERLAY INTERNO (COMPATIBLE CON IPHONE Y ANDROID)
   inlineSheetOverlay: {
     position: 'absolute',
     top: 0,
@@ -2857,4 +3054,57 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   dangerBtnText: { color: '#FFFFFF', fontWeight: 'bold', fontSize: 15 },
+  qrModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  qrModalCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 28,
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 24,
+    width: '100%',
+    maxWidth: 380,
+    elevation: 20,
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 16,
+  },
+  qrMockContainer: {
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 16,
+    padding: 18,
+    marginBottom: 16,
+  },
+  qrGridBox: {
+    padding: 12,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    marginBottom: 12,
+  },
+  qrPetNameText: { fontSize: 18, fontWeight: 'bold', color: '#0F172A' },
+  qrSubText: { fontSize: 12, color: '#64748B', marginTop: 2 },
+  qrAlertBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FCA5A5',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    marginTop: 8,
+  },
+  qrAlertBadgeText: { fontSize: 11, fontWeight: 'bold', color: '#B91C1C', marginLeft: 4 },
 });
