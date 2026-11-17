@@ -14,6 +14,7 @@ export interface Pet {
   owner_phone: string;
   owner_rut: string;
   owner_address: string;
+  cloud_id?: string | null;
 }
 
 export interface EmergencyContact {
